@@ -319,6 +319,13 @@ jobs:
         cp -r $(go env GOROOT)/* $GITHUB_WORKSPACE/toolchain/go/
         cd $GITHUB_WORKSPACE/toolchain/
         tar -czf $GITHUB_WORKSPACE/toolchain.tar.gz .
+        rm -rf $GITHUB_WORKSPACE/toolchain
+
+    - name: Pack GoMod Vendor
+      if: ${{ matrix.jobs.goversion == '' && matrix.jobs.test == 'test' }}
+      run: |
+        go mod vendor
+        tar -czf $GITHUB_WORKSPACE/vendor.tar.gz vendor
 
     - name: Save version
       run: |
@@ -336,6 +343,7 @@ jobs:
           mihomo*.pkg.tar.zst
           mihomo*.zip
           toolchain.tar.gz
+          vendor.tar.gz
           version.txt
           checksums.txt
 
