@@ -312,6 +312,14 @@ jobs:
           --architecture ${{ matrix.jobs.pacman }} \
           mihomo=/usr/bin/mihomo
 
+    - name: Pack Golang Toolchain
+      if: ${{ matrix.jobs.goversion == '' && matrix.jobs.test == 'test' }}
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/toolchain/go
+        cp -r $(go env GOROOT)/* $GITHUB_WORKSPACE/toolchain/go/
+        cd $GITHUB_WORKSPACE/toolchain/
+        tar -czf $GITHUB_WORKSPACE/toolchain.tar.gz .
+
     - name: Save version
       run: |
         echo ${VERSION} > version.txt
@@ -327,6 +335,7 @@ jobs:
           mihomo*.rpm
           mihomo*.pkg.tar.zst
           mihomo*.zip
+          toolchain.tar.gz
           version.txt
           checksums.txt
 
