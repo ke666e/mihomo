@@ -1,0 +1,255 @@
+name: 同步标签与发布
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get upstream repo
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          UPSTREAM_REPO=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')
+          UPSTREAM_CLONE_URL=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.clone_url // empty')
+
+          if [ -z "$UPSTREAM_REPO" ] || [ -z "$UPSTREAM_CLONE_URL" ]; then
+            echo "没有识别到上游仓库。请确认当前仓库是 fork 仓库。"
+            exit 1
+          fi
+
+          echo "上游仓库: $UPSTREAM_REPO"
+          echo "上游地址: $UPSTREAM_CLONE_URL"
+
+          echo "repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "clone_url=$UPSTREAM_CLONE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream tag
+        id: latest_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+        run: |
+          set -e
+
+          LATEST_TAG=$(gh api "repos/${UPSTREAM_REPO}/tags?per_page=1" --jq '.[0].name // empty')
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "上游没有 tag。"
+            echo "has_tag=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "上游最新 tag: $LATEST_TAG"
+            echo "has_tag=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check and sync latest tag
+        if: steps.latest_tag.outputs.has_tag == 'true'
+        env:
+          TAG: ${{ steps.latest_tag.outputs.tag }}
+          UPSTREAM_CLONE_URL: ${{ steps.upstream.outputs.clone_url }}
+        run: |
+          set -e
+
+          echo "检查本地是否已有最新 tag: $TAG"
+
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG"; then
+            echo "本地已有最新 tag: $TAG，不需要同步 tag。"
+            exit 0
+          fi
+
+          echo "本地没有最新 tag，开始同步: $TAG"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_CLONE_URL"
+
+          git fetch upstream "refs/tags/$TAG:refs/tags/$TAG" --force
+          git push origin "refs/tags/$TAG:refs/tags/$TAG" --force
+
+          echo "最新 tag 已同步: $TAG"
+
+      - name: Get latest upstream release
+        id: latest_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+        run: |
+          set -e
+
+          if gh api "repos/${UPSTREAM_REPO}/releases/latest" > /tmp/latest-release.json 2>/dev/null; then
+            RELEASE_TAG=$(jq -r '.tag_name // empty' /tmp/latest-release.json)
+            RELEASE_NAME=$(jq -r '.name // .tag_name // empty' /tmp/latest-release.json)
+            IS_PRERELEASE=$(jq -r '.prerelease // false' /tmp/latest-release.json)
+            UPSTREAM_ASSET_COUNT=$(jq -r '.assets | length' /tmp/latest-release.json)
+
+            echo "上游最新 Release tag: $RELEASE_TAG"
+            echo "上游最新 Release 名称: $RELEASE_NAME"
+            echo "上游 Release assets 数量: $UPSTREAM_ASSET_COUNT"
+
+            echo "has_release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+            echo "name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+            echo "asset_count=$UPSTREAM_ASSET_COUNT" >> "$GITHUB_OUTPUT"
+          else
+            echo "上游没有 latest release，只同步 tag，不同步发布。"
+            echo "has_release=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "name=" >> "$GITHUB_OUTPUT"
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "asset_count=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check local release and assets
+        id: release_check
+        if: steps.latest_release.outputs.has_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.latest_release.outputs.tag }}
+          UPSTREAM_ASSET_COUNT: ${{ steps.latest_release.outputs.asset_count }}
+        run: |
+          set -e
+
+          NEED_RELEASE_SYNC=false
+
+          echo "检查本地 Release: $RELEASE_TAG"
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "本地已有 Release: $RELEASE_TAG"
+
+            LOCAL_ASSET_COUNT=$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets | length')
+
+            echo "本地 assets 数量: $LOCAL_ASSET_COUNT"
+            echo "上游 assets 数量: $UPSTREAM_ASSET_COUNT"
+
+            if [ "$UPSTREAM_ASSET_COUNT" -gt 0 ] && [ "$LOCAL_ASSET_COUNT" -lt "$UPSTREAM_ASSET_COUNT" ]; then
+              echo "本地 assets 不完整，需要同步发布文件。"
+              NEED_RELEASE_SYNC=true
+            else
+              echo "本地 Release 和 assets 已完整。"
+            fi
+          else
+            echo "本地没有 Release: $RELEASE_TAG，需要创建。"
+            NEED_RELEASE_SYNC=true
+          fi
+
+          echo "need_sync=$NEED_RELEASE_SYNC" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if release already synced
+        if: steps.latest_release.outputs.has_release == 'true' && steps.release_check.outputs.need_sync == 'false'
+        run: |
+          echo "最新 Release 和 assets 已经同步，不需要处理发布。"
+
+      - name: Ensure release tag exists locally
+        if: steps.latest_release.outputs.has_release == 'true' && steps.release_check.outputs.need_sync == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.latest_release.outputs.tag }}
+          UPSTREAM_CLONE_URL: ${{ steps.upstream.outputs.clone_url }}
+        run: |
+          set -e
+
+          echo "确保 Release 对应 tag 已同步: $RELEASE_TAG"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_CLONE_URL"
+
+          git fetch upstream "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" --force
+          git push origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" --force
+
+      - name: Download upstream release info and assets
+        if: steps.latest_release.outputs.has_release == 'true' && steps.release_check.outputs.need_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+          RELEASE_TAG: ${{ steps.latest_release.outputs.tag }}
+        run: |
+          set -e
+
+          rm -rf /tmp/release-assets
+          mkdir -p /tmp/release-assets
+
+          gh release view "$RELEASE_TAG" \
+            --repo "$UPSTREAM_REPO" \
+            --json body \
+            --jq '.body // ""' > /tmp/release-body.md
+
+          echo "下载上游 Release assets: $RELEASE_TAG"
+
+          gh release download "$RELEASE_TAG" \
+            --repo "$UPSTREAM_REPO" \
+            --dir /tmp/release-assets \
+            --clobber || true
+
+          echo "下载完成，文件列表："
+          ls -lh /tmp/release-assets || true
+
+      - name: Create or update local release
+        if: steps.latest_release.outputs.has_release == 'true' && steps.release_check.outputs.need_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.latest_release.outputs.tag }}
+          RELEASE_NAME: ${{ steps.latest_release.outputs.name }}
+          IS_PRERELEASE: ${{ steps.latest_release.outputs.is_prerelease }}
+        run: |
+          set -e
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "本地 Release 已存在，更新标题和说明: $RELEASE_TAG"
+
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$RELEASE_NAME" \
+              --notes-file /tmp/release-body.md
+          else
+            echo "创建本地 Release: $RELEASE_TAG"
+
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "$RELEASE_NAME" \
+                --notes-file /tmp/release-body.md \
+                --prerelease
+            else
+              gh release create "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "$RELEASE_NAME" \
+                --notes-file /tmp/release-body.md
+            fi
+          fi
+
+      - name: Upload assets to local release
+        if: steps.latest_release.outputs.has_release == 'true' && steps.release_check.outputs.need_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.latest_release.outputs.tag }}
+        run: |
+          set -e
+
+          if [ -d /tmp/release-assets ] && [ "$(ls -A /tmp/release-assets)" ]; then
+            echo "上传 assets 到本地 Release: $RELEASE_TAG"
+
+            gh release upload "$RELEASE_TAG" /tmp/release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "上游 Release 没有 assets，跳过上传。"
+          fi
