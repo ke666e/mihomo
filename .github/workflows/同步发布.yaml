@@ -1,4 +1,4 @@
-name: Sync Latest Upstream Release
+name: Sync Release
 
 on:
   workflow_dispatch:
